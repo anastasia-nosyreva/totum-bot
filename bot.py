@@ -328,12 +328,10 @@ def get_primer_field(category: str, field: str) -> str:
 
 
 def validate_exam_diagnostics(txt: str, course: str) -> list:
-    """Проверяет обязательные элементы для ОГЭ/ЕГЭ."""
     if not ("огэ" in course.lower() or "егэ" in course.lower()):
         return []
     missing = []
     low = txt.lower()
-
     if not re.search(r"\d+\s*(?:из|/)\s*\d+", txt):
         missing.append("результат в баллах (например «8 из 22»)")
     if not any(w in low for w in ["низк", "средн", "высок"]):
@@ -344,7 +342,6 @@ def validate_exam_diagnostics(txt: str, course: str) -> list:
         missing.append("фраза о том, что тестирование включало не весь перечень заданий")
     if not any(w in low for w in ["восполн", "укрепить", "систематизир", "рекомендаций педагога"]):
         missing.append("фраза про восполнение пробелов / работу с рекомендациями педагога")
-
     return missing
 
 
@@ -403,6 +400,18 @@ def db_init():
                 c.execute("ALTER TABLE feedback ADD COLUMN self_notes TEXT DEFAULT ''")
             if "is_oral" not in cols:
                 c.execute("ALTER TABLE feedback ADD COLUMN is_oral INTEGER DEFAULT 0")
+            if "recipient_id" not in cols:
+                c.execute("ALTER TABLE feedback ADD COLUMN recipient_id INTEGER DEFAULT 0")
+            if "status" not in cols:
+                c.execute("ALTER TABLE feedback ADD COLUMN status TEXT DEFAULT 'pending'")
+            if "review_comment" not in cols:
+                c.execute("ALTER TABLE feedback ADD COLUMN review_comment TEXT DEFAULT ''")
+            if "reviewed_at" not in cols:
+                c.execute("ALTER TABLE feedback ADD COLUMN reviewed_at TEXT DEFAULT ''")
+            if "reviewed_by" not in cols:
+                c.execute("ALTER TABLE feedback ADD COLUMN reviewed_by INTEGER DEFAULT 0")
+            if "gender" not in cols:
+                c.execute("ALTER TABLE feedback ADD COLUMN gender TEXT DEFAULT ''")
             conn.commit()
     except Exception:
         pass
@@ -437,7 +446,13 @@ def db_init():
         materials TEXT,
         self_notes TEXT,
         full_text TEXT,
-        is_oral INTEGER DEFAULT 0
+        is_oral INTEGER DEFAULT 0,
+        recipient_id INTEGER DEFAULT 0,
+        status TEXT DEFAULT 'pending',
+        review_comment TEXT DEFAULT '',
+        reviewed_at TEXT DEFAULT '',
+        reviewed_by INTEGER DEFAULT 0,
+        gender TEXT DEFAULT ''
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -463,6 +478,21 @@ def db_init():
     conn.close()
 
 
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID
+
+
+def is_umo(user_id: int) -> bool:
+    if is_admin(user_id):
+        return True
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM umo WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row is not None
+
+
 def db_get_user(user_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -481,19 +511,110 @@ def db_save_user(user_id, name):
     conn.close()
 
 
-def db_save_feedback(user_id, teacher_name, data, full_text, is_oral=0):
+def db_save_feedback(user_id, teacher_name, data, full_text, recipient_id, is_oral=0):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""INSERT INTO feedback
         (user_id, teacher_name, created_at, lesson_date, child, course,
          activity, diagnostics, recommendations, materials, self_notes,
-         full_text, is_oral)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+         full_text, is_oral, recipient_id, status, gender)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
         (user_id, teacher_name, datetime.now().isoformat(),
          data.get("date", ""), data.get("child", ""), data.get("course", ""),
          data.get("activity", ""), data.get("diagnostics", ""),
          data.get("recommendations", ""), data.get("materials", ""),
-         data.get("self_notes", ""), full_text, is_oral))
+         data.get("self_notes", ""), full_text, is_oral, recipient_id,
+         data.get("gender", "")))
+    conn.commit()
+    fid = c.lastrowid
+    conn.close()
+    return fid
+
+
+def db_update_feedback_after_revision(fid, data, full_text):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""UPDATE feedback SET
+        lesson_date = ?, child = ?, course = ?,
+        activity = ?, diagnostics = ?, recommendations = ?,
+        materials = ?, self_notes = ?, full_text = ?, gender = ?,
+        status = 'pending', review_comment = '', reviewed_at = '', reviewed_by = 0
+        WHERE id = ?""",
+        (data.get("date", ""), data.get("child", ""), data.get("course", ""),
+         data.get("activity", ""), data.get("diagnostics", ""),
+         data.get("recommendations", ""), data.get("materials", ""),
+         data.get("self_notes", ""), full_text, data.get("gender", ""),
+         fid))
+    conn.commit()
+    conn.close()
+
+
+def db_get_feedback_full(fid):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""SELECT id, user_id, teacher_name, created_at, lesson_date, child,
+                 course, activity, diagnostics, recommendations, materials,
+                 self_notes, full_text, is_oral, recipient_id, status,
+                 review_comment, reviewed_at, reviewed_by, gender
+                 FROM feedback WHERE id = ?""", (fid,))
+    row = c.fetchone()
+    conn.close()
+    return row
+
+
+def db_umo_inbox(user_id, only_mine=True):
+    """Возвращает список (id, lesson_date, child, course, teacher_name) со status='pending'."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if only_mine:
+        c.execute("""SELECT id, lesson_date, child, course, teacher_name
+                     FROM feedback
+                     WHERE status = 'pending' AND recipient_id = ?
+                     ORDER BY id DESC""", (user_id,))
+    else:
+        c.execute("""SELECT id, lesson_date, child, course, teacher_name
+                     FROM feedback
+                     WHERE status = 'pending'
+                     ORDER BY id DESC""")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def db_umo_archive(user_id, only_mine=True):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if only_mine:
+        c.execute("""SELECT id, lesson_date, child, course, teacher_name
+                     FROM feedback
+                     WHERE status = 'accepted' AND recipient_id = ?
+                     ORDER BY id DESC LIMIT 50""", (user_id,))
+    else:
+        c.execute("""SELECT id, lesson_date, child, course, teacher_name
+                     FROM feedback
+                     WHERE status = 'accepted'
+                     ORDER BY id DESC LIMIT 50""")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+
+def db_mark_accepted(fid, umo_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""UPDATE feedback SET status = 'accepted',
+                 reviewed_at = ?, reviewed_by = ? WHERE id = ?""",
+              (datetime.now().isoformat(), umo_id, fid))
+    conn.commit()
+    conn.close()
+
+
+def db_mark_needs_revision(fid, umo_id, comment):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""UPDATE feedback SET status = 'needs_revision',
+                 review_comment = ?, reviewed_at = ?, reviewed_by = ?
+                 WHERE id = ?""", (comment, datetime.now().isoformat(), umo_id, fid))
     conn.commit()
     conn.close()
 
@@ -523,6 +644,10 @@ def db_stats():
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM feedback")
     total = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM feedback WHERE status = 'pending'")
+    pending = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM feedback WHERE status = 'accepted'")
+    accepted = c.fetchone()[0]
     c.execute("SELECT course, COUNT(*) FROM feedback GROUP BY course ORDER BY 2 DESC LIMIT 5")
     top_courses = c.fetchall()
     c.execute("SELECT teacher_name, COUNT(*) FROM feedback GROUP BY user_id ORDER BY 2 DESC LIMIT 5")
@@ -530,7 +655,7 @@ def db_stats():
     c.execute("SELECT substr(created_at, 1, 7) AS m, COUNT(*) FROM feedback GROUP BY m ORDER BY m DESC LIMIT 6")
     by_month = c.fetchall()
     conn.close()
-    return total, top_courses, top_teachers, by_month
+    return total, pending, accepted, top_courses, top_teachers, by_month
 
 
 def db_add_note(user_id, text):
@@ -630,6 +755,7 @@ def db_remove_umo(user_id: int):
     conn.close()
 # ================== КЛАВИАТУРЫ ==================
 def main_menu_kb():
+    """Меню педагога."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Создать письменную ОС", callback_data="new_written")],
         [InlineKeyboardButton(text="📞 Создать устную ОС", callback_data="new_oral")],
@@ -637,6 +763,24 @@ def main_menu_kb():
         [InlineKeyboardButton(text="📝 Мои заметки", callback_data="notes")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton(text="📖 Памятка", callback_data="memo")],
+    ])
+
+
+def umo_menu_kb(user_id: int):
+    """Меню УМО. Если это админ — добавляем кнопку для переключения в режим педагога."""
+    rows = [
+        [InlineKeyboardButton(text="📥 Входящие", callback_data="umo_inbox")],
+        [InlineKeyboardButton(text="📚 Архив", callback_data="umo_archive")],
+        [InlineKeyboardButton(text="📊 Статистика центра", callback_data="umo_stats")],
+        [InlineKeyboardButton(text="✏️ Я педагог", callback_data="umo_to_teacher")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def umo_menu_from_teacher_kb():
+    """Кнопка возврата в УМО-меню, показывается в меню педагога для УМО."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 В режим УМО", callback_data="umo_back")],
     ])
 
 
@@ -841,6 +985,22 @@ def dx_confirm_kb():
     ])
 
 
+def umo_review_kb(fid: int):
+    """Кнопки для просмотра ОС в УМО."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принято", callback_data=f"umo_accept:{fid}")],
+        [InlineKeyboardButton(text="⚠️ На доработку", callback_data=f"umo_revise:{fid}")],
+        [InlineKeyboardButton(text="🔙 К входящим", callback_data="umo_inbox")],
+    ])
+
+
+def umo_revision_done_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Входящие", callback_data="umo_inbox")],
+        [InlineKeyboardButton(text="🏠 В меню УМО", callback_data="umo_menu")],
+    ])
+
+
 # ================== СОСТОЯНИЯ ==================
 class OS(StatesGroup):
     name_reg = State()
@@ -862,6 +1022,7 @@ class OS(StatesGroup):
     oral_growth = State()
     oral_recommendation = State()
     note_add = State()
+    umo_review_comment = State()
 
 
 # ================== ПРОМПТЫ ==================
@@ -932,23 +1093,35 @@ PROMPTS = {
         "специалисту УМО вместе с ОС, но <b>родитель их не увидит</b>.\n\n"
         "Если писать нечего — жми «⏭ Пропустить»."
     ),
-    "recommendations": (
+            "recommendations": (
         "🎯 <b>6️⃣ Рекомендации по формату</b>\n\n"
-        "Что написать: формат занятий и систематичность.\n\n"
-        "⚠️ Не дублируй фразу про домашку — если уже писал её в блоке "
-        "диагностики, здесь не повторяй.\n\n"
-        "⚠️ Не пиши: стоимость, расписание, гарантии, здоровье, политику.\n\n"
-        "📌 <b>Быстрая вставка</b> (тапни, потом дополни своими словами):\n\n"
-        "⚠️ <b>Это пример заполнения — НЕ копируй дословно.</b>\n\n"
+        "Здесь напиши, какой формат занятий предпочтителен и о систематичности.\n\n"
+        "Как профессионал ты можешь написать: рекомендуется обучение "
+        "в группе, индивидуально, онлайн или офлайн, возможно нужно "
+        "взять пару онлайн-индивидуальных занятий к групповым.\n\n"
+        "<b>Как отвечать:</b>\n"
+        "1. Тапни на шаблон ниже → он скопируется.\n"
+        "2. Вставь в поле ответа.\n"
+        "3. Дополни своими словами.\n"
+        "4. Отправь сообщением.\n\n"
+        "📋 <b>Шаблон (тапни, чтобы скопировать):</b>\n"
+        "<code>Рекомендуется посещение занятий в групповом формате, "
+        "их регулярность, а также систематическое выполнение домашних "
+        "заданий.</code>\n\n"
         "👉 <b>Пример для этого типа курса</b> (тапни, чтобы раскрыть)"
     ),
-    "materials": (
+            "materials": (
         "🎯 <b>7️⃣ Материалы для занятий</b>\n\n"
-        "Что написать: что ребёнку нужно для обучения в центре "
-        "(тетради, папки, карандаши и т.д.).\n\n"
-        "Список зависит от курса — уточняй под конкретный предмет.\n\n"
-        "📌 <b>Быстрая вставка</b> (тапни, потом дополни своими словами):\n\n"
-        "⚠️ <b>Это пример заполнения — НЕ копируй дословно.</b>\n\n"
+        "Здесь напиши, что ребёнку нужно для обучения в центре.\n\n"
+        "Список зависит от курса — уточняй под конкретный предмет: "
+        "тетради, папки, карандаши, прописи, скетчбук и т.д.\n\n"
+        "<b>Как отвечать:</b>\n"
+        "1. Тапни на шаблон ниже → он скопируется.\n"
+        "2. Вставь в поле ответа.\n"
+        "3. Допиши список материалов.\n"
+        "4. Отправь сообщением.\n\n"
+        "📋 <b>Шаблон (тапни, чтобы скопировать):</b>\n"
+        "<code>Для обучения необходимо: </code>\n\n"
         "👉 <b>Пример для этого типа курса</b> (тапни, чтобы раскрыть)"
     ),
 }
@@ -1192,7 +1365,9 @@ async def clear_draft(user_id: int):
     await cancel_draft_timer(user_id)
 
 
-async def show_menu(target, user_id):
+# ================== МЕНЮ ==================
+async def show_teacher_menu(target, user_id):
+    """Показывает меню педагога. Для УМО добавляет кнопку «в режим УМО»."""
     name = db_get_user(user_id) or "педагог"
     text = (
         f"👋 Привет, <b>{esc(name)}</b>!\n\n"
@@ -1203,13 +1378,47 @@ async def show_menu(target, user_id):
         "в день урока. Родитель должен получить её в течение 24 часов.\n\n"
         "Выбери что делаем?"
     )
+    kb = main_menu_kb()
+    if is_umo(user_id):
+        # Добавляем кнопку возврата в УМО
+        rows = list(kb.inline_keyboard)
+        rows.append([InlineKeyboardButton(text="📥 В режим УМО", callback_data="umo_back")])
+        kb = InlineKeyboardMarkup(inline_keyboard=rows)
+
     if isinstance(target, CallbackQuery):
         try:
-            await target.message.edit_text(text, reply_markup=main_menu_kb())
+            await target.message.edit_text(text, reply_markup=kb)
         except TelegramBadRequest:
-            await target.message.answer(text, reply_markup=main_menu_kb())
+            await target.message.answer(text, reply_markup=kb)
     else:
-        await target.answer(text, reply_markup=main_menu_kb())
+        await target.answer(text, reply_markup=kb)
+
+
+async def show_umo_menu(target, user_id):
+    """Показывает меню УМО."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if is_admin(user_id):
+        c.execute("SELECT COUNT(*) FROM feedback WHERE status = 'pending'")
+    else:
+        c.execute("SELECT COUNT(*) FROM feedback WHERE status = 'pending' AND recipient_id = ?", (user_id,))
+    pending_count = c.fetchone()[0]
+    conn.close()
+
+    name = db_get_user(user_id) or "специалист"
+    text = (
+        f"👋 Привет, <b>{esc(name)}</b>!\n\n"
+        "Ты в режиме <b>специалиста УМО</b>.\n\n"
+        f"📥 Входящих на проверку: <b>{pending_count}</b>\n\n"
+        "Выбери что делать:"
+    )
+    if isinstance(target, CallbackQuery):
+        try:
+            await target.message.edit_text(text, reply_markup=umo_menu_kb(user_id))
+        except TelegramBadRequest:
+            await target.message.answer(text, reply_markup=umo_menu_kb(user_id))
+    else:
+        await target.answer(text, reply_markup=umo_menu_kb(user_id))
 
 
 # ================== ОБРАБОТКА ОШИБОК ==================
@@ -1249,6 +1458,11 @@ async def cmd_start(msg: Message, state: FSMContext):
         await state.set_state(OS.name_reg)
         return
 
+    # Если УМО — сразу меню УМО
+    if is_umo(user_id):
+        await show_umo_menu(msg, user_id)
+        return
+
     draft = db_get_draft(user_id)
     if draft:
         _, _, updated = draft
@@ -1266,7 +1480,7 @@ async def cmd_start(msg: Message, state: FSMContext):
             pass
         db_delete_draft(user_id)
 
-    await show_menu(msg, user_id)
+    await show_teacher_menu(msg, user_id)
 
 
 @dp.message(OS.name_reg)
@@ -1278,7 +1492,10 @@ async def step_name_reg(msg: Message, state: FSMContext):
     db_save_user(msg.from_user.id, name)
     await state.clear()
     await msg.answer(f"✅ Записал: <b>{esc(name)}</b>")
-    await show_menu(msg, msg.from_user.id)
+    if is_umo(msg.from_user.id):
+        await show_umo_menu(msg, msg.from_user.id)
+    else:
+        await show_teacher_menu(msg, msg.from_user.id)
 
 
 @dp.message(Command("menu"))
@@ -1287,15 +1504,21 @@ async def cmd_menu(msg: Message, state: FSMContext):
     if db_get_user(msg.from_user.id) is None:
         await cmd_start(msg, state)
         return
-    await show_menu(msg, msg.from_user.id)
+    if is_umo(msg.from_user.id):
+        await show_umo_menu(msg, msg.from_user.id)
+    else:
+        await show_teacher_menu(msg, msg.from_user.id)
 
 
 @dp.message(Command("cancel"))
 async def cmd_cancel(msg: Message, state: FSMContext):
     await state.clear()
     await clear_draft(msg.from_user.id)
-    await msg.answer("Отменил. Что делаем дальше?")
-    await show_menu(msg, msg.from_user.id)
+    await msg.answer("Отменил.")
+    if is_umo(msg.from_user.id):
+        await show_umo_menu(msg, msg.from_user.id)
+    else:
+        await show_teacher_menu(msg, msg.from_user.id)
 
 
 @dp.message(Command("rename"))
@@ -1315,22 +1538,17 @@ async def cmd_help(msg: Message):
         "🤖 <b>Как со мной работать</b>\n\n"
         "1. Нажми «📝 Создать письменную ОС» — проведу по шагам и в конце "
         "дам готовый текст.\n\n"
-        "2. На каждом шаге есть подсказка — что писать. Если что-то "
-        "непонятно, тапай на спойлер с примером.\n\n"
+        "2. На каждом шаге есть подсказка — что писать.\n\n"
         "3. В любой момент можно написать /cancel.\n\n"
-        "4. Готовый текст я выдам в виде <code>-блока. Тапнешь по нему — "
-        "скопируется целиком.\n\n"
-        "5. Если возникла ошибка — введи /start и начни заново.\n\n"
-        "6. Команда /rename НовоеИмя — поменять твоё ФИО в системе.\n\n"
-        "📞 Если был пробный урок с родителем в центре — "
-        "используй «Создать устную ОС».\n\n"
-        "Есть вопросы? Пиши специалисту УМО."
+        "4. Готовый текст — в <code>-блоке. Тапнешь — скопируется.\n\n"
+        "5. Команда /rename НовоеИмя — поменять ФИО.\n\n"
+        "📞 Устная ОС — если был родитель в центре."
     )
 
 
 @dp.message(Command("umo"))
 async def cmd_umo(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
         await msg.answer("Только для администратора.")
         return
     ids = db_get_umo()
@@ -1345,7 +1563,7 @@ async def cmd_umo(msg: Message):
 
 @dp.message(Command("umo_add"))
 async def cmd_umo_add(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
         return
     parts = msg.text.split(maxsplit=2)
     if len(parts) < 3:
@@ -1362,7 +1580,7 @@ async def cmd_umo_add(msg: Message):
 
 @dp.message(Command("umo_remove"))
 async def cmd_umo_remove(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
         return
     parts = msg.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().isdigit():
@@ -1375,7 +1593,7 @@ async def cmd_umo_remove(msg: Message):
 
 @dp.message(Command("export"))
 async def cmd_export(msg: Message):
-    if msg.from_user.id != ADMIN_ID:
+    if not is_admin(msg.from_user.id):
         await msg.answer("Эта команда только для администратора.")
         return
     rows = db_all_feedback_for_export()
@@ -1393,18 +1611,410 @@ async def cmd_export(msg: Message):
     await msg.answer_document(file, caption=f"📦 Всего ОС: {len(rows)}")
 
 
-# ================== МЕНЮ ==================
+# ================== МЕНЮ (callback) ==================
 @dp.callback_query(F.data == "menu")
 async def cb_menu(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await clear_draft(call.from_user.id)
-    await show_menu(call, call.from_user.id)
+    if is_umo(call.from_user.id):
+        await show_umo_menu(call, call.from_user.id)
+    else:
+        await show_teacher_menu(call, call.from_user.id)
     await call.answer()
 
 
 @dp.callback_query(F.data == "noop")
 async def cb_noop(call: CallbackQuery):
     await call.answer()
+
+
+@dp.callback_query(F.data == "umo_menu")
+async def cb_umo_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_umo_menu(call, call.from_user.id)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "umo_to_teacher")
+async def cb_umo_to_teacher(call: CallbackQuery, state: FSMContext):
+    """Переключение в режим педагога (для УМО)."""
+    await state.clear()
+    await show_teacher_menu(call, call.from_user.id)
+    await call.answer("Режим педагога")
+
+
+@dp.callback_query(F.data == "umo_back")
+async def cb_umo_back(call: CallbackQuery, state: FSMContext):
+    """Возврат в режим УМО."""
+    await state.clear()
+    await show_umo_menu(call, call.from_user.id)
+    await call.answer("Режим УМО")
+
+
+# ================== УМО: ВХОДЯЩИЕ ==================
+@dp.callback_query(F.data == "umo_inbox")
+async def cb_umo_inbox(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    only_mine = not is_admin(call.from_user.id)
+    rows = db_umo_inbox(call.from_user.id, only_mine=only_mine)
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if not rows:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 В меню УМО", callback_data="umo_menu")]
+        ])
+        await call.message.answer("📭 Входящих ОС нет.", reply_markup=kb)
+        await call.answer()
+        return
+
+    buttons = []
+    for fid, lesson_date, child, course, teacher_name in rows:
+        text = f"{lesson_date or '?'} — {child or '?'} — {course or '?'}\n   👩 от {teacher_name or '?'}"
+        # Telegram не любит длинные кнопки
+        short = f"{lesson_date or '?'} · {child or '?'} · от {teacher_name or '?'}"
+        if len(short) > 60:
+            short = short[:57] + "..."
+        buttons.append([InlineKeyboardButton(text=short, callback_data=f"umo_view:{fid}")])
+    buttons.append([InlineKeyboardButton(text="🏠 В меню УМО", callback_data="umo_menu")])
+
+    await call.message.answer(
+        f"📥 <b>Входящие ОС ({len(rows)})</b>\n\nТапни на любую, чтобы открыть.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("umo_view:"))
+async def cb_umo_view(call: CallbackQuery):
+    fid = int(call.data.split(":", 1)[1])
+    row = db_get_feedback_full(fid)
+    if not row:
+        await call.answer("Не найдено", show_alert=True)
+        return
+
+    (fid, user_id, teacher_name, created_at, lesson_date, child,
+     course, activity, diagnostics, recommendations, materials,
+     self_notes, full_text, is_oral, recipient_id, status,
+     review_comment, reviewed_at, reviewed_by, gender) = row
+
+    # Проверяем права: админ видит всё, остальные УМО — только свои
+    if not is_admin(call.from_user.id) and recipient_id != call.from_user.id:
+        await call.answer("Эта ОС не тебе адресована", show_alert=True)
+        return
+
+    header = (
+        f"📄 <b>ОС от педагога {esc(teacher_name)}</b>\n\n"
+        f"👶 Ребёнок: <b>{esc(child or '')}</b>\n"
+        f"📚 Курс: {esc(course or '')}\n"
+        f"📅 Дата урока: {esc(lesson_date or '')}\n"
+    )
+
+    if self_notes:
+        full_text_show = (
+            f"{full_text}\n\n"
+            "—————————\n\n"
+            f"📝 <b>Заметка педагога:</b>\n{esc(self_notes)}"
+        )
+    else:
+        full_text_show = full_text
+
+    # Убираем HTML-теги из full_text для безопасности
+    text_clean = full_text_show.replace("<b>", "").replace("</b>", "")
+
+    await call.message.answer(header)
+    await call.message.answer(
+        f"<code>{esc(text_clean)}</code>",
+        reply_markup=umo_review_kb(fid),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("umo_accept:"))
+async def cb_umo_accept(call: CallbackQuery):
+    fid = int(call.data.split(":", 1)[1])
+    row = db_get_feedback_full(fid)
+    if not row:
+        await call.answer("Не найдено", show_alert=True)
+        return
+
+    recipient_id = row[14]
+    teacher_id = row[1]
+    child = row[5]
+    course = row[6]
+
+    if not is_admin(call.from_user.id) and recipient_id != call.from_user.id:
+        await call.answer("Эта ОС не тебе адресована", show_alert=True)
+        return
+
+    db_mark_accepted(fid, call.from_user.id)
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await call.message.answer(
+        "✅ ОС принята. Она отправлена в Архив.",
+        reply_markup=umo_revision_done_kb(),
+    )
+
+    # Уведомляем педагога
+    try:
+        await bot.send_message(
+            teacher_id,
+            f"✅ <b>Твоя ОС проверена и принята.</b>\n\n"
+            f"👶 Ребёнок: <b>{esc(child or '')}</b>\n"
+            f"📚 Курс: {esc(course or '')}\n\n"
+            "Можешь передавать её родителю.",
+        )
+    except Exception as e:
+        log.warning(f"Не смог уведомить педагога {teacher_id}: {e}")
+
+    await call.answer("Принято")
+
+
+@dp.callback_query(F.data.startswith("umo_revise:"))
+async def cb_umo_revise(call: CallbackQuery, state: FSMContext):
+    fid = int(call.data.split(":", 1)[1])
+    row = db_get_feedback_full(fid)
+    if not row:
+        await call.answer("Не найдено", show_alert=True)
+        return
+
+    recipient_id = row[14]
+    if not is_admin(call.from_user.id) and recipient_id != call.from_user.id:
+        await call.answer("Эта ОС не тебе адресована", show_alert=True)
+        return
+
+    await state.update_data(_revise_fid=fid)
+    await state.set_state(OS.umo_review_comment)
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await call.message.answer(
+        "⚠️ <b>Что нужно доработать?</b>\n\n"
+        "Напиши комментарий для педагога — что именно поправить. "
+        "Он увидит твой текст и сможет отредактировать ОС.",
+    )
+    await call.answer()
+
+
+@dp.message(OS.umo_review_comment)
+async def step_umo_review_comment(msg: Message, state: FSMContext):
+    comment = clean_block(msg.text or "")
+    if len(comment) < 5:
+        await msg.answer("Слишком коротко. Напиши хотя бы пару слов, что поправить.")
+        return
+
+    data = await state.get_data()
+    fid = data.get("_revise_fid")
+    if not fid:
+        await state.clear()
+        await msg.answer("Ошибка, попробуй заново.")
+        return
+
+    row = db_get_feedback_full(fid)
+    if not row:
+        await state.clear()
+        await msg.answer("ОС не найдена.")
+        return
+
+    teacher_id = row[1]
+    child = row[5]
+    course = row[6]
+
+    db_mark_needs_revision(fid, msg.from_user.id, comment)
+
+    await state.clear()
+
+    await msg.answer(
+        "✅ Комментарий отправлен педагогу. ОС вернётся к нему на доработку.",
+        reply_markup=umo_revision_done_kb(),
+    )
+
+    # Уведомляем педагога
+    try:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Открыть и исправить", callback_data=f"revise_open:{fid}")]
+        ])
+        await bot.send_message(
+            teacher_id,
+            f"⚠️ <b>Твоя ОС требует доработки.</b>\n\n"
+            f"👶 Ребёнок: <b>{esc(child or '')}</b>\n"
+            f"📚 Курс: {esc(course or '')}\n\n"
+            f"<b>Что поправить:</b>\n{esc(comment)}",
+            reply_markup=kb,
+        )
+    except Exception as e:
+        log.warning(f"Не смог уведомить педагога {teacher_id}: {e}")
+
+
+# ================== УМО: АРХИВ ==================
+@dp.callback_query(F.data == "umo_archive")
+async def cb_umo_archive(call: CallbackQuery):
+    only_mine = not is_admin(call.from_user.id)
+    rows = db_umo_archive(call.from_user.id, only_mine=only_mine)
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if not rows:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 В меню УМО", callback_data="umo_menu")]
+        ])
+        await call.message.answer("📭 Архив пуст.", reply_markup=kb)
+        await call.answer()
+        return
+
+    buttons = []
+    for fid, lesson_date, child, course, teacher_name in rows:
+        short = f"{lesson_date or '?'} · {child or '?'} · {course or '?'}"
+        if len(short) > 60:
+            short = short[:57] + "..."
+        buttons.append([InlineKeyboardButton(text=short, callback_data=f"umo_view_arch:{fid}")])
+    buttons.append([InlineKeyboardButton(text="🏠 В меню УМО", callback_data="umo_menu")])
+
+    await call.message.answer(
+        f"📚 <b>Архив (последние {len(rows)})</b>\n\nПроверенные и принятые ОС.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("umo_view_arch:"))
+async def cb_umo_view_arch(call: CallbackQuery):
+    fid = int(call.data.split(":", 1)[1])
+    row = db_get_feedback_full(fid)
+    if not row:
+        await call.answer("Не найдено", show_alert=True)
+        return
+
+    recipient_id = row[14]
+    if not is_admin(call.from_user.id) and recipient_id != call.from_user.id:
+        await call.answer("Эта ОС не тебе адресована", show_alert=True)
+        return
+
+    full_text = row[12]
+    self_notes = row[11]
+    teacher_name = row[2]
+    child = row[5]
+    course = row[6]
+    lesson_date = row[4]
+
+    header = (
+        f"📄 <b>ОС от педагога {esc(teacher_name)}</b>\n\n"
+        f"👶 Ребёнок: <b>{esc(child or '')}</b>\n"
+        f"📚 Курс: {esc(course or '')}\n"
+        f"📅 Дата урока: {esc(lesson_date or '')}\n"
+    )
+
+    if self_notes:
+        full_text_show = (
+            f"{full_text}\n\n"
+            "—————————\n\n"
+            f"📝 <b>Заметка педагога:</b>\n{esc(self_notes)}"
+        )
+    else:
+        full_text_show = full_text
+
+    text_clean = full_text_show.replace("<b>", "").replace("</b>", "")
+
+    await call.message.answer(header)
+    await call.message.answer(f"<code>{esc(text_clean)}</code>")
+    await call.answer()
+
+
+# ================== УМО: СТАТИСТИКА ==================
+@dp.callback_query(F.data == "umo_stats")
+async def cb_umo_stats(call: CallbackQuery):
+    total, pending, accepted, top_courses, top_teachers, by_month = db_stats()
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    lines = [
+        "📊 <b>Статистика центра «Тотум»</b>\n",
+        f"📄 Всего ОС: <b>{total}</b>",
+        f"📥 На проверке: <b>{pending}</b>",
+        f"✅ Принято: <b>{accepted}</b>\n",
+    ]
+
+    if by_month:
+        lines.append("📅 <b>По месяцам:</b>")
+        month_names = ["янв", "фев", "мар", "апр", "май", "июн",
+                       "июл", "авг", "сен", "окт", "ноя", "дек"]
+        for m, cnt in by_month:
+            try:
+                y, mm = m.split("-")
+                label = f"{month_names[int(mm)-1]} {y}"
+            except Exception:
+                label = m
+            lines.append(f"  • {label}: {cnt}")
+        lines.append("")
+
+    if top_courses:
+        lines.append("🔥 <b>Популярные курсы:</b>")
+        for course, cnt in top_courses:
+            lines.append(f"  • {esc(course)} — {cnt}")
+        lines.append("")
+
+    if top_teachers:
+        lines.append("👩‍🏫 <b>Топ педагогов:</b>")
+        for name, cnt in top_teachers:
+            lines.append(f"  • {esc(name)} — {cnt}")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 В меню УМО", callback_data="umo_menu")]
+    ])
+    await call.message.answer("\n".join(lines), reply_markup=kb)
+    await call.answer()
+
+
+# ================== ПЕРЕОТКРЫТИЕ ОС НА ДОРАБОТКУ ==================
+@dp.callback_query(F.data.startswith("revise_open:"))
+async def cb_revise_open(call: CallbackQuery, state: FSMContext):
+    fid = int(call.data.split(":", 1)[1])
+    row = db_get_feedback_full(fid)
+    if not row:
+        await call.answer("ОС не найдена", show_alert=True)
+        return
+
+    teacher_id = row[1]
+    if teacher_id != call.from_user.id and not is_admin(call.from_user.id):
+        await call.answer("Это не твоя ОС", show_alert=True)
+        return
+
+    # Восстанавливаем данные в state
+    await state.clear()
+    await clear_draft(call.from_user.id)
+
+    await state.update_data(
+        date=row[4], child=row[5], course=row[6],
+        activity=row[7], diagnostics=row[8],
+        recommendations=row[9], materials=row[10],
+        self_notes=row[11], gender=row[19],
+        _revise_fid=fid,  # запомним, что это правка существующей ОС
+        _revise_recipient=row[14],  # кому отправить заново
+    )
+
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await show_preview(call.message, state)
+    await call.answer("Открываю ОС для правки")
 
 
 # ================== НАЗАД ==================
@@ -1431,7 +2041,10 @@ async def cb_back(call: CallbackQuery, state: FSMContext):
     if prev is None or prev == "menu":
         await state.clear()
         await clear_draft(call.from_user.id)
-        await show_menu(call, call.from_user.id)
+        if is_umo(call.from_user.id):
+            await show_umo_menu(call, call.from_user.id)
+        else:
+            await show_teacher_menu(call, call.from_user.id)
         await call.answer()
         return
 
@@ -1581,11 +2194,27 @@ async def step_gender(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
+    # Если это «Ещё ребёнок из группы» — курс и активность уже заполнены.
+    # Пропускаем выбор курса и сразу идём к диагностике.
+    if data.get("activity") and data.get("course"):
+        cat = data.get("category") or data.get("course_category", "")
+        primer = get_primer_field(cat, "diagnostics")
+        await call.message.answer(
+            f"Курс: <b>{esc(data.get('course', ''))}</b>\n"
+            f"Что происходило: <i>скопировано из предыдущей ОС</i>\n\n"
+            + PROMPTS["diagnostics"]
+            + f"\n\n<blockquote>{esc(primer)}</blockquote>",
+            reply_markup=step_kb(),
+        )
+        await state.set_state(OS.diagnostics)
+        await save_draft(call.from_user.id, state)
+        await call.answer()
+        return
+
     await call.message.answer("3️⃣ Выбери раздел курсов:", reply_markup=categories_kb())
     await state.set_state(OS.category)
     await save_draft(call.from_user.id, state)
     await call.answer()
-
 
 # --- Категории ---
 @dp.callback_query(OS.category, F.data.startswith("catpage:"))
@@ -1833,7 +2462,7 @@ async def step_activity(msg: Message, state: FSMContext):
     await save_draft(msg.from_user.id, state)
 
 
-# --- Диагностика с валидацией ОГЭ/ЕГЭ ---
+# --- Диагностика с валидацией ---
 @dp.message(OS.diagnostics)
 async def step_diagnostics(msg: Message, state: FSMContext):
     txt = clean_block(msg.text or "")
@@ -2151,10 +2780,11 @@ async def cb_edit(call: CallbackQuery, state: FSMContext):
         await state.set_state(OS.materials)
     await save_draft(call.from_user.id, state)
     await call.answer()
-# --- Отправка в УМО: педагог видит текст → выбирает получателя ---
+
+
+# --- Отправка в УМО ---
 @dp.callback_query(OS.confirm, F.data == "send")
 async def cb_send(call: CallbackQuery, state: FSMContext):
-    """Педагог нажал «Передать в УМО» — показываем текст + спрашиваем кому."""
     data = await state.get_data()
 
     teacher_name = db_get_user(call.from_user.id) or "Без имени"
@@ -2168,13 +2798,51 @@ async def cb_send(call: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
+    # Если это правка после доработки — покажем кому, но без выбора
+    if data.get("_revise_fid"):
+        recipient_id = data.get("_revise_recipient")
+        # Отправляем обратно тому же адресату
+        row = db_get_umo()
+        recipient_name = next((name for uid, name in row if uid == recipient_id), str(recipient_id))
+
+        await state.update_data(_plain_text=plain, _teacher_name=teacher_name)
+
+        # Обновляем ОС
+        fid = data.get("_revise_fid")
+        db_update_feedback_after_revision(fid, data, plain)
+
+        # Уведомляем УМО
+        try:
+            await bot.send_message(
+                recipient_id,
+                f"📝 <b>Педагог {esc(teacher_name)} доработал ОС.</b>\n\n"
+                f"👶 Ребёнок: <b>{esc(data.get('child', ''))}</b>\n"
+                f"📚 Курс: {esc(data.get('course', ''))}\n"
+                f"📅 Дата урока: {esc(data.get('date', ''))}\n\n"
+                "—————————\n\n"
+                f"{esc(plain)}",
+            )
+            await call.message.answer(
+                f"✅ ОС доработана и отправлена обратно — <b>{esc(recipient_name)}</b>.",
+            )
+        except Exception as e:
+            await call.message.answer(
+                f"❌ Не удалось отправить обратно {esc(recipient_name)}: {e}"
+            )
+
+        await state.clear()
+        await clear_draft(call.from_user.id)
+        await call.message.answer("Что дальше?", reply_markup=main_menu_kb())
+        await call.answer("Отправлено")
+        return
+
+    # Обычная отправка — выбираем получателя
     umo_list = db_get_umo()
     if not umo_list:
         await call.message.answer("⚠️ Нет ни одного специалиста УМО. Напиши админу.")
         await call.answer()
         return
 
-    # Показываем педагогу готовый текст + спрашиваем, кому отправить
     await call.message.answer(
         "📄 <b>Готовый текст ОС:</b>\n\n"
         f"<code>{esc(plain)}</code>",
@@ -2199,8 +2867,6 @@ async def cb_umo_send(call: CallbackQuery, state: FSMContext):
         await call.answer("Ошибка, отправь заново", show_alert=True)
         return
 
-    await state.update_data(_sent=True)
-
     all_umo = db_get_umo()
     if target == "all":
         recipients = all_umo
@@ -2212,8 +2878,10 @@ async def cb_umo_send(call: CallbackQuery, state: FSMContext):
         await call.answer("Получатель не найден", show_alert=True)
         return
 
-    # Сохраняем ОС в БД
-    db_save_feedback(call.from_user.id, teacher_name, data, plain, is_oral=0)
+    # Сохраняем — каждому получателю своя запись в БД (чтобы статус независимо)
+    for umo_id, umo_name in recipients:
+        db_save_feedback(call.from_user.id, teacher_name, data, plain,
+                         recipient_id=umo_id, is_oral=0)
     await clear_draft(call.from_user.id)
 
     # Данные для «Ещё ребёнок»
@@ -2231,7 +2899,6 @@ async def cb_umo_send(call: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
-    # Собираем статусы по каждому получателю
     statuses = []
     for umo_id, umo_name in recipients:
         name = umo_name or str(umo_id)
@@ -2259,7 +2926,7 @@ async def cb_umo_send(call: CallbackQuery, state: FSMContext):
                     f"{esc(plain)}"
                 )
             await bot.send_message(umo_id, umo_text)
-            statuses.append(f"✅ <b>{esc(name)}</b> — ОС получена")
+            statuses.append(f"✅ <b>{esc(name)}</b> — ОС отправлена")
         except Exception as e:
             log.warning(f"Не смог отправить УМО {umo_id} ({name}): {e}")
             statuses.append(
@@ -2267,13 +2934,9 @@ async def cb_umo_send(call: CallbackQuery, state: FSMContext):
                 f"(пусть напишет боту /start)"
             )
 
-    # Показываем педагогу статус
-    status_text = "\n".join(statuses)
     await call.message.answer(
-        "📤 <b>Статус отправки:</b>\n\n" + status_text
+        "📤 <b>Статус отправки:</b>\n\n" + "\n".join(statuses)
     )
-
-    # Дальше — предложение написать ОС на другого ребёнка
     await call.message.answer(
         "На этом уроке и в этой же группе были ещё дети, "
         "которым нужно написать ОС?",
@@ -2312,8 +2975,7 @@ async def cb_same_lesson(call: CallbackQuery, state: FSMContext):
         f"• Что происходило: <i>скопировано из предыдущей ОС</i>\n\n"
         f"Осталось заполнить:\n"
         f"👶 <b>2️⃣ ФИО ребёнка</b>\n\n"
-        f"Напиши фамилию и имя в именительном падеже — как в электронном "
-        f"журнале.\n\n"
+        f"Напиши фамилию и имя в именительном падеже.\n\n"
         f"✅ Пример: Иванов Иван",
         reply_markup=step_kb(),
     )
@@ -2408,18 +3070,21 @@ async def step_oral_recommendation(msg: Message, state: FSMContext):
         f"«У вас есть вопросы по тому, как мы будем заниматься?»"
     )
 
-    db_save_feedback(
-        msg.from_user.id, teacher,
-        {"date": now, "child": child, "course": "(устная)",
-         "activity": data.get("oral_strength", ""),
-         "diagnostics": data.get("oral_growth", ""),
-         "recommendations": data.get("oral_recommendation", ""),
-         "materials": "", "self_notes": ""},
-        shpargalka_plain,
-        is_oral=1,
-    )
+    # Сохраняем по одной записи на каждого УМО
+    for umo_id, umo_name in db_get_umo():
+        db_save_feedback(
+            msg.from_user.id, teacher,
+            {"date": now, "child": child, "course": "(устная)",
+             "activity": data.get("oral_strength", ""),
+             "diagnostics": data.get("oral_growth", ""),
+             "recommendations": data.get("oral_recommendation", ""),
+             "materials": "", "self_notes": "", "gender": ""},
+            shpargalka_plain,
+            recipient_id=umo_id,
+            is_oral=1,
+        )
 
-    # Отправка всем УМО + статусы
+    # Отправляем
     statuses = []
     for umo_id, umo_name in db_get_umo():
         name = umo_name or str(umo_id)
@@ -2436,9 +3101,7 @@ async def step_oral_recommendation(msg: Message, state: FSMContext):
             log.warning(f"Не смог отправить УМО {umo_id} ({name}): {e}")
             statuses.append(f"❌ <b>{esc(name)}</b> — не доставлено")
 
-    await msg.answer(
-        "📤 <b>Статус отправки:</b>\n\n" + "\n".join(statuses)
-    )
+    await msg.answer("📤 <b>Статус отправки:</b>\n\n" + "\n".join(statuses))
     await state.clear()
     await msg.answer("Что дальше?", reply_markup=main_menu_kb())
 
@@ -2489,16 +3152,20 @@ async def cb_hist_view(call: CallbackQuery):
     await call.answer()
 
 
-# ================== СТАТИСТИКА ==================
+# ================== СТАТИСТИКА (педагога) ==================
 @dp.callback_query(F.data == "stats")
 async def cb_stats(call: CallbackQuery):
-    total, top_courses, top_teachers, by_month = db_stats()
+    total, pending, accepted, top_courses, top_teachers, by_month = db_stats()
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
 
-    lines = [f"📊 <b>Всего ОС создано:</b> {total}\n"]
+    lines = [
+        f"📊 <b>Всего ОС создано:</b> {total}\n",
+        f"📥 На проверке: {pending}",
+        f"✅ Принято: {accepted}\n",
+    ]
     if by_month:
         lines.append("📅 <b>По месяцам:</b>")
         month_names = ["янв", "фев", "мар", "апр", "май", "июн",
@@ -2773,7 +3440,10 @@ async def cb_draft_restart(call: CallbackQuery, state: FSMContext):
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await show_menu(call, call.from_user.id)
+    if is_umo(call.from_user.id):
+        await show_umo_menu(call, call.from_user.id)
+    else:
+        await show_teacher_menu(call, call.from_user.id)
     await call.answer("Начинаем заново")
 
 
@@ -2801,6 +3471,8 @@ async def heartbeat():
             drafts = c.fetchone()[0]
             c.execute("SELECT COUNT(*) FROM users")
             users = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM feedback WHERE status = 'pending'")
+            pending = c.fetchone()[0]
             conn.close()
 
             now = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -2810,6 +3482,7 @@ async def heartbeat():
                 f"🕐 {now}\n\n"
                 f"👥 Педагогов: {users}\n"
                 f"📄 Всего ОС: {total}\n"
+                f"📥 На проверке: {pending}\n"
                 f"📝 Активных черновиков: {drafts}\n\n"
                 f"Следующий отчёт — через {HEARTBEAT_HOURS} ч.",
             )
