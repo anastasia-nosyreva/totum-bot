@@ -531,19 +531,21 @@ def db_save_feedback(user_id, teacher_name, data, full_text, recipient_id, is_or
     return fid
 
 
-def db_update_feedback_after_revision(fid, data, full_text):
+def db_update_feedback_after_revision(fid, data, full_text, recipient_id):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""UPDATE feedback SET
         lesson_date = ?, child = ?, course = ?,
         activity = ?, diagnostics = ?, recommendations = ?,
         materials = ?, self_notes = ?, full_text = ?, gender = ?,
+        recipient_id = ?,
         status = 'pending', review_comment = '', reviewed_at = '', reviewed_by = 0
         WHERE id = ?""",
         (data.get("date", ""), data.get("child", ""), data.get("course", ""),
          data.get("activity", ""), data.get("diagnostics", ""),
          data.get("recommendations", ""), data.get("materials", ""),
          data.get("self_notes", ""), full_text, data.get("gender", ""),
+         recipient_id,
          fid))
     conn.commit()
     conn.close()
@@ -563,7 +565,6 @@ def db_get_feedback_full(fid):
 
 
 def db_umo_inbox(user_id, only_mine=True):
-    """Возвращает список (id, lesson_date, child, course, teacher_name) со status='pending'."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if only_mine:
@@ -755,7 +756,6 @@ def db_remove_umo(user_id: int):
     conn.close()
 # ================== КЛАВИАТУРЫ ==================
 def main_menu_kb():
-    """Меню педагога."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Создать письменную ОС", callback_data="new_written")],
         [InlineKeyboardButton(text="📞 Создать устную ОС", callback_data="new_oral")],
@@ -767,7 +767,6 @@ def main_menu_kb():
 
 
 def umo_menu_kb(user_id: int):
-    """Меню УМО. Если это админ — добавляем кнопку для переключения в режим педагога."""
     rows = [
         [InlineKeyboardButton(text="📥 Входящие", callback_data="umo_inbox")],
         [InlineKeyboardButton(text="📚 Архив", callback_data="umo_archive")],
@@ -778,7 +777,6 @@ def umo_menu_kb(user_id: int):
 
 
 def umo_menu_from_teacher_kb():
-    """Кнопка возврата в УМО-меню, показывается в меню педагога для УМО."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📥 В режим УМО", callback_data="umo_back")],
     ])
@@ -923,20 +921,11 @@ def umo_choice_kb():
 
 
 def recommendation_insert_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📌 Групповой формат", callback_data="ins:group")],
-        [InlineKeyboardButton(text="📌 Индивидуальный формат", callback_data="ins:indiv")],
-        [InlineKeyboardButton(text="📌 Группа + пара индивидуальных", callback_data="ins:mix")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
-    ])
+    return step_kb()
 
 
 def materials_insert_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📌 Пустой шаблон «Для обучения необходимо:»",
-                              callback_data="ins:materials_empty")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back")],
-    ])
+    return step_kb()
 
 
 def self_notes_kb():
@@ -986,7 +975,6 @@ def dx_confirm_kb():
 
 
 def umo_review_kb(fid: int):
-    """Кнопки для просмотра ОС в УМО."""
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принято", callback_data=f"umo_accept:{fid}")],
         [InlineKeyboardButton(text="⚠️ На доработку", callback_data=f"umo_revise:{fid}")],
@@ -1093,14 +1081,14 @@ PROMPTS = {
         "специалисту УМО вместе с ОС, но <b>родитель их не увидит</b>.\n\n"
         "Если писать нечего — жми «⏭ Пропустить»."
     ),
-            "recommendations": (
+    "recommendations": (
         "🎯 <b>6️⃣ Рекомендации по формату</b>\n\n"
         "Здесь напиши, какой формат занятий предпочтителен и о систематичности.\n\n"
         "Как профессионал ты можешь написать: рекомендуется обучение "
         "в группе, индивидуально, онлайн или офлайн, возможно нужно "
         "взять пару онлайн-индивидуальных занятий к групповым.\n\n"
         "<b>Как отвечать:</b>\n"
-        "1. Тапни на шаблон ниже → он скопируется.\n"
+        "1. Тапни на шаблон в спойлере ниже → он скопируется.\n"
         "2. Вставь в поле ответа.\n"
         "3. Дополни своими словами.\n"
         "4. Отправь сообщением.\n\n"
@@ -1110,13 +1098,13 @@ PROMPTS = {
         "заданий.</code>\n\n"
         "👉 <b>Пример для этого типа курса</b> (тапни, чтобы раскрыть)"
     ),
-            "materials": (
+    "materials": (
         "🎯 <b>7️⃣ Материалы для занятий</b>\n\n"
-        "Здесь напиши, что ребёнку нужно для обучения в центре.\n\n"
-        "Список зависит от курса — уточняй под конкретный предмет: "
-        "тетради, папки, карандаши, прописи, скетчбук и т.д.\n\n"
+        "Что написать: что ребёнку нужно для обучения в центре "
+        "(тетради, папки, карандаши и т.д.).\n\n"
+        "Список зависит от курса — уточняй под конкретный предмет.\n\n"
         "<b>Как отвечать:</b>\n"
-        "1. Тапни на шаблон ниже → он скопируется.\n"
+        "1. Тапни на шаблон в спойлере ниже → он скопируется.\n"
         "2. Вставь в поле ответа.\n"
         "3. Допиши список материалов.\n"
         "4. Отправь сообщением.\n\n"
@@ -1367,7 +1355,6 @@ async def clear_draft(user_id: int):
 
 # ================== МЕНЮ ==================
 async def show_teacher_menu(target, user_id):
-    """Показывает меню педагога. Для УМО добавляет кнопку «в режим УМО»."""
     name = db_get_user(user_id) or "педагог"
     text = (
         f"👋 Привет, <b>{esc(name)}</b>!\n\n"
@@ -1380,7 +1367,6 @@ async def show_teacher_menu(target, user_id):
     )
     kb = main_menu_kb()
     if is_umo(user_id):
-        # Добавляем кнопку возврата в УМО
         rows = list(kb.inline_keyboard)
         rows.append([InlineKeyboardButton(text="📥 В режим УМО", callback_data="umo_back")])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1395,7 +1381,6 @@ async def show_teacher_menu(target, user_id):
 
 
 async def show_umo_menu(target, user_id):
-    """Показывает меню УМО."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     if is_admin(user_id):
@@ -1458,7 +1443,6 @@ async def cmd_start(msg: Message, state: FSMContext):
         await state.set_state(OS.name_reg)
         return
 
-    # Если УМО — сразу меню УМО
     if is_umo(user_id):
         await show_umo_menu(msg, user_id)
         return
@@ -1637,7 +1621,6 @@ async def cb_umo_menu(call: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "umo_to_teacher")
 async def cb_umo_to_teacher(call: CallbackQuery, state: FSMContext):
-    """Переключение в режим педагога (для УМО)."""
     await state.clear()
     await show_teacher_menu(call, call.from_user.id)
     await call.answer("Режим педагога")
@@ -1645,7 +1628,6 @@ async def cb_umo_to_teacher(call: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "umo_back")
 async def cb_umo_back(call: CallbackQuery, state: FSMContext):
-    """Возврат в режим УМО."""
     await state.clear()
     await show_umo_menu(call, call.from_user.id)
     await call.answer("Режим УМО")
@@ -1673,8 +1655,6 @@ async def cb_umo_inbox(call: CallbackQuery, state: FSMContext):
 
     buttons = []
     for fid, lesson_date, child, course, teacher_name in rows:
-        text = f"{lesson_date or '?'} — {child or '?'} — {course or '?'}\n   👩 от {teacher_name or '?'}"
-        # Telegram не любит длинные кнопки
         short = f"{lesson_date or '?'} · {child or '?'} · от {teacher_name or '?'}"
         if len(short) > 60:
             short = short[:57] + "..."
@@ -1701,7 +1681,6 @@ async def cb_umo_view(call: CallbackQuery):
      self_notes, full_text, is_oral, recipient_id, status,
      review_comment, reviewed_at, reviewed_by, gender) = row
 
-    # Проверяем права: админ видит всё, остальные УМО — только свои
     if not is_admin(call.from_user.id) and recipient_id != call.from_user.id:
         await call.answer("Эта ОС не тебе адресована", show_alert=True)
         return
@@ -1722,7 +1701,6 @@ async def cb_umo_view(call: CallbackQuery):
     else:
         full_text_show = full_text
 
-    # Убираем HTML-теги из full_text для безопасности
     text_clean = full_text_show.replace("<b>", "").replace("</b>", "")
 
     await call.message.answer(header)
@@ -1762,7 +1740,6 @@ async def cb_umo_accept(call: CallbackQuery):
         reply_markup=umo_revision_done_kb(),
     )
 
-    # Уведомляем педагога
     try:
         await bot.send_message(
             teacher_id,
@@ -1839,7 +1816,6 @@ async def step_umo_review_comment(msg: Message, state: FSMContext):
         reply_markup=umo_revision_done_kb(),
     )
 
-    # Уведомляем педагога
     try:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✏️ Открыть и исправить", callback_data=f"revise_open:{fid}")]
@@ -1995,17 +1971,20 @@ async def cb_revise_open(call: CallbackQuery, state: FSMContext):
         await call.answer("Это не твоя ОС", show_alert=True)
         return
 
-    # Восстанавливаем данные в state
     await state.clear()
     await clear_draft(call.from_user.id)
+
+    # Получатель: recipient_id, если пусто — тот, кто отправил на доработку
+    # (reviewed_by), если и его нет — админ
+    recipient = row[14] or row[18] or ADMIN_ID
 
     await state.update_data(
         date=row[4], child=row[5], course=row[6],
         activity=row[7], diagnostics=row[8],
         recommendations=row[9], materials=row[10],
         self_notes=row[11], gender=row[19],
-        _revise_fid=fid,  # запомним, что это правка существующей ОС
-        _revise_recipient=row[14],  # кому отправить заново
+        _revise_fid=fid,
+        _revise_recipient=recipient,
     )
 
     try:
@@ -2195,7 +2174,7 @@ async def step_gender(call: CallbackQuery, state: FSMContext):
         return
 
     # Если это «Ещё ребёнок из группы» — курс и активность уже заполнены.
-    # Пропускаем выбор курса и сразу идём к диагностике.
+    # Пропускаем выбор курса и идём к диагностике.
     if data.get("activity") and data.get("course"):
         cat = data.get("category") or data.get("course_category", "")
         primer = get_primer_field(cat, "diagnostics")
@@ -2215,6 +2194,7 @@ async def step_gender(call: CallbackQuery, state: FSMContext):
     await state.set_state(OS.category)
     await save_draft(call.from_user.id, state)
     await call.answer()
+
 
 # --- Категории ---
 @dp.callback_query(OS.category, F.data.startswith("catpage:"))
@@ -2598,30 +2578,6 @@ async def step_selfnotes_text(msg: Message, state: FSMContext):
 
 
 # --- Рекомендации ---
-@dp.callback_query(OS.recommendations, F.data.startswith("ins:"))
-async def step_insert(call: CallbackQuery, state: FSMContext):
-    what = call.data.split(":", 1)[1]
-    insert_text = ""
-    if what == "group":
-        insert_text = ("Рекомендуется посещение занятий в групповом формате, "
-                       "их регулярность, а также систематическое выполнение "
-                       "домашних заданий.")
-    elif what == "indiv":
-        insert_text = ("Рекомендуется посещение занятий в индивидуальном "
-                       "формате, а также систематическое выполнение "
-                       "домашних заданий.")
-    elif what == "mix":
-        insert_text = ("Рекомендуется посещение занятий в групповом формате, "
-                       "а также дополнительно 1–2 индивидуальных занятия в "
-                       "месяц для точечной проработки сложных тем.")
-    await call.message.answer(
-        f"📌 <b>Вставь в ответ ниже</b> (скопируй и отправь сообщением):\n\n"
-        f"<code>{esc(insert_text)}</code>",
-        reply_markup=recommendation_insert_kb(),
-    )
-    await call.answer()
-
-
 @dp.message(OS.recommendations)
 async def step_recommendations(msg: Message, state: FSMContext):
     txt = clean_block(msg.text or "")
@@ -2650,16 +2606,6 @@ async def step_recommendations(msg: Message, state: FSMContext):
 
 
 # --- Материалы ---
-@dp.callback_query(OS.materials, F.data == "ins:materials_empty")
-async def step_materials_empty(call: CallbackQuery, state: FSMContext):
-    await call.message.answer(
-        "📌 <b>Вставь в ответ ниже и дополни:</b>\n\n"
-        "<code>Для обучения необходимо: </code>",
-        reply_markup=materials_insert_kb(),
-    )
-    await call.answer()
-
-
 @dp.message(OS.materials)
 async def step_materials(msg: Message, state: FSMContext):
     txt = clean_block(msg.text or "")
@@ -2798,20 +2744,19 @@ async def cb_send(call: CallbackQuery, state: FSMContext):
     except Exception:
         pass
 
-    # Если это правка после доработки — покажем кому, но без выбора
+    # Если это правка после доработки — отправляем обратно тому же адресату
     if data.get("_revise_fid"):
-        recipient_id = data.get("_revise_recipient")
-        # Отправляем обратно тому же адресату
-        row = db_get_umo()
-        recipient_name = next((name for uid, name in row if uid == recipient_id), str(recipient_id))
+        recipient_id = data.get("_revise_recipient") or ADMIN_ID
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT name FROM umo WHERE user_id = ?", (recipient_id,))
+        row = c.fetchone()
+        conn.close()
+        recipient_name = row[0] if row else str(recipient_id)
 
-        await state.update_data(_plain_text=plain, _teacher_name=teacher_name)
-
-        # Обновляем ОС
         fid = data.get("_revise_fid")
-        db_update_feedback_after_revision(fid, data, plain)
+        db_update_feedback_after_revision(fid, data, plain, recipient_id)
 
-        # Уведомляем УМО
         try:
             await bot.send_message(
                 recipient_id,
@@ -2878,13 +2823,11 @@ async def cb_umo_send(call: CallbackQuery, state: FSMContext):
         await call.answer("Получатель не найден", show_alert=True)
         return
 
-    # Сохраняем — каждому получателю своя запись в БД (чтобы статус независимо)
     for umo_id, umo_name in recipients:
         db_save_feedback(call.from_user.id, teacher_name, data, plain,
                          recipient_id=umo_id, is_oral=0)
     await clear_draft(call.from_user.id)
 
-    # Данные для «Ещё ребёнок»
     await state.update_data(
         _sent=False,
         _last_date=data.get("date"),
@@ -3070,7 +3013,6 @@ async def step_oral_recommendation(msg: Message, state: FSMContext):
         f"«У вас есть вопросы по тому, как мы будем заниматься?»"
     )
 
-    # Сохраняем по одной записи на каждого УМО
     for umo_id, umo_name in db_get_umo():
         db_save_feedback(
             msg.from_user.id, teacher,
@@ -3084,7 +3026,6 @@ async def step_oral_recommendation(msg: Message, state: FSMContext):
             is_oral=1,
         )
 
-    # Отправляем
     statuses = []
     for umo_id, umo_name in db_get_umo():
         name = umo_name or str(umo_id)
